@@ -76,6 +76,60 @@ installer:
 6. adds GC roots so `nix-collect-garbage` does not remove the shell, and
 7. builds the environment once, which proves it works offline.
 
+### Home Manager
+
+`mkHomeBundle` bundles a Home Manager configuration the same way. Running the
+bundle copies the configuration's closure into `/nix/store` and runs its
+activation as you: `home.packages` land in your profile and the managed dotfiles
+are linked.
+
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+    home-manager.url = "github:nix-community/home-manager/release-26.05";
+    home-manager.inputs.nixpkgs.follows = "nixpkgs";
+    airgap.url = "github:Marauder586/nix-airgap";
+    airgap.inputs.nixpkgs.follows = "nixpkgs";
+  };
+
+  outputs = { self, nixpkgs, home-manager, airgap }: {
+    homeConfigurations.alice = home-manager.lib.homeManagerConfiguration {
+      pkgs = nixpkgs.legacyPackages.x86_64-linux;
+      modules = [{
+        home = {
+          username = "alice"; # the user on the air-gapped machine
+          homeDirectory = "/home/alice";
+          stateVersion = "26.05";
+          packages = [ nixpkgs.legacyPackages.x86_64-linux.jq ];
+        };
+      }];
+    };
+
+    # packages.x86_64-linux.airgap-home-alice
+    packages = airgap.lib.bundleHomeConfigurations self { };
+  };
+}
+```
+
+```console
+$ nix build .#airgap-home-alice     # online
+$ sh result                         # on the air-gapped machine, as alice
+```
+
+- `home.username` and `home.homeDirectory` are fixed at build time, so set them
+  to the target's user. The installer checks both before installing anything
+  and refuses to activate for anyone else.
+- Files that are in the way of managed ones (like Ubuntu's stock `~/.bashrc`)
+  are renamed to `FILE.airgap.bak`; choose another suffix with `--backup-ext`.
+- Home Manager roots the generation it activates, so it survives
+  `nix-collect-garbage`. No `.envrc` is written.
+- `mkHomeBundle { pkgs; homeConfiguration; }` takes `name`, `includeLix`, `lix`,
+  `extraPaths`, `sbom` and `compression` like `mkDevShellBundle`. To combine
+  with dev shell bundles, merge the two with `nixpkgs.lib.recursiveUpdate`.
+- The SBOM's root is the activation package:
+  `nix run github:Marauder586/nix-airgap#sbom -- .#airgap-home-alice`.
+
 ### SBOM
 
 `nix run …#sbom` writes one CycloneDX SBOM of **everything the bundle ships**,
@@ -161,7 +215,8 @@ name field every tar implementation ignores. That field holds:
 ```
 
 A shell runs that line, which runs the installer (`stub/stub.sh`) out of the
-archive and exits before reaching any binary data. The other members are
+archive and exits before reaching any binary data. The manifest's `kind`
+(`devshell` or `home`) tells the installer what to do after copying. The other members are
 `stub.sh`, `manifest`, `cache.tar.zst` (or `cache.tar` with `compression = null`),
 and optionally `sbom.cdx.json` and `lix/`.
 
@@ -178,4 +233,6 @@ $ nix fmt              # format everything (treefmt.toml)
 an Ubuntu cloud image with `restrict=on` user networking (no route out) and
 checks: installing on a blank machine (Lix + direnv), extracting the SBOM before
 Nix exists, using an existing Nix, re-runs, an existing `.envrc`, `--dry-run`, and
-surviving `nix-collect-garbage`. Its SBOM is generated with `nix run .#sbom`.
+surviving `nix-collect-garbage`; and for a real Home Manager configuration
+(`tests/consumer-home`): refusing another user, activation (packages, files, bash
+config, the stock `.bashrc` backed up), re-runs and GC. Its SBOM is generated with `nix run .#sbom`.

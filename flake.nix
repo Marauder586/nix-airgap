@@ -227,6 +227,80 @@
                 touch $out
               '';
 
+          # A Home Manager bundle, from a stand-in for homeManagerConfiguration's
+          # result (just the attributes mkHomeBundle uses), so this flake needs
+          # no home-manager input. tests/e2e.sh uses the real Home Manager.
+          home-bundle =
+            let
+              activation = pkgs.writeTextFile {
+                name = "home-manager-generation";
+                destination = "/activate";
+                executable = true;
+                text = ''
+                  #!${pkgs.runtimeShell}
+                  echo activated ${pkgs.hello}/bin/hello
+                '';
+              };
+              homeConfiguration = {
+                activationPackage = activation;
+                config.home = {
+                  username = "alice";
+                  homeDirectory = "/home/alice";
+                };
+              };
+              # The same extra arguments for both, so they must be the same bundle.
+              args = {
+                sbom = fakeSbom { shell = activation; };
+                compression.level = 3;
+              };
+              bundle = self.lib.mkHomeBundle ({ inherit pkgs homeConfiguration; } // args);
+              byName = self.lib.bundleHomeConfigurations { homeConfigurations.alice = homeConfiguration; } args;
+            in
+            pkgs.runCommand "check-home-bundle"
+              {
+                nativeBuildInputs = [
+                  pkgs.gnutar
+                  pkgs.dash
+                  pkgs.zstd
+                ];
+              }
+              ''
+                [ "$(tar -tf ${bundle})" = "$(printf 'stub.sh\nmanifest\ncache.tar.zst\nsbom.cdx.json')" ]
+                mkdir x && tar -xf ${bundle} -C x
+                grep -qx 'kind=home' x/manifest
+                grep -qx 'name=home-alice' x/manifest
+                grep -qx 'activation=${activation}' x/manifest
+                grep -qx 'home_user=alice' x/manifest
+                grep -qx 'home_directory=/home/alice' x/manifest
+                ! grep -q '^drv=' x/manifest
+
+                # The cache holds the activation package's closure (hello too),
+                # and both Nix and Lix accept it.
+                mkdir cache && zstd -dcq --long=31 x/cache.tar.zst | tar -xf - -C cache
+                grep -qx '${activation}' cache/store-paths
+                grep -qx '${pkgs.hello}' cache/store-paths
+                export HOME=$TMPDIR
+                for impl in ${pkgs.nix} ${pkgs.lix}; do
+                  store="local?root=$TMPDIR/store-$(basename $impl)"
+                  $impl/bin/nix --extra-experimental-features nix-command copy --no-check-sigs \
+                    --from "file://$PWD/cache" --to "$store" --stdin < cache/store-paths
+                  $impl/bin/nix --extra-experimental-features nix-command path-info \
+                    --store "$store" ${activation} >/dev/null
+                done
+
+                # The installer refuses to activate for the wrong user, before
+                # touching anything (this build user isn't alice).
+                ! HOME=/home/alice dash ${bundle} 2>err
+                grep -q "is for user 'alice'" err
+                ! dash ${bundle} ./project 2>err
+                grep -q "don't take a project directory" err
+                dash ${bundle} --help | grep -q 'Home Manager'
+
+                # bundleHomeConfigurations names it per system.
+                [ ${byName.${pkgs.stdenv.hostPlatform.system}.airgap-home-alice} = ${bundle} ]
+                touch $out
+              '';
+
           # An SBOM of a different derivation must fail the build.
           stale-sbom =
             let

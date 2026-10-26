@@ -18,22 +18,28 @@ die() {
 
 usage() {
   cat <<EOF
-Usage: sh $BUNDLE [options] [project-dir]
+Usage: sh $BUNDLE [options] [project-dir]   (dev shell bundles)
+       sh $BUNDLE [options]                 (Home Manager bundles)
        sh $BUNDLE --sbom [dir]
 
-Copies the bundled Nix dev shell into /nix/store with \`nix copy\` (installing
-Lix first if the bundle includes it and Nix is missing) and writes an .envrc
-into project-dir (default: the current directory) that loads the shell offline.
-The binary cache is unpacked under \$TMPDIR (default /tmp) first.
+Copies the bundle's store paths into /nix/store with \`nix copy\` (installing
+Lix first if the bundle includes it and Nix is missing). The binary cache is
+unpacked under \$TMPDIR (default /tmp) first. Then:
+  - a dev shell bundle writes an .envrc into project-dir (default: the current
+    directory) that loads the shell offline;
+  - a Home Manager bundle runs the configuration's activation as you, which
+    must be the user it was built for.
 
 Options:
-  --dry-run   print what would be done without changing anything
-  --list      list the bundle contents
-  --sbom      only extract the bundled CycloneDX SBOM (sbom.cdx.json) into
-              dir (default: the current directory); needs nothing but tar
-  --force     replace an existing .envrc that nix-airgap did not write
-  --no-envrc  only import the store paths
-  -h, --help  show this help
+  --dry-run          print what would be done without changing anything
+  --list             list the bundle contents
+  --sbom             only extract the bundled CycloneDX SBOM (sbom.cdx.json)
+                     into dir (default: the current directory); needs only tar
+  --force            replace an existing .envrc that nix-airgap did not write
+  --no-envrc         only import the store paths (dev shell bundles)
+  --backup-ext EXT   Home Manager bundles: rename files that are in the way of
+                     managed ones to FILE.EXT (default: airgap.bak)
+  -h, --help         show this help
 EOF
 }
 
@@ -41,7 +47,9 @@ dry_run=0
 sbom_only=0
 force=0
 write_envrc=1
+backup_ext=airgap.bak
 dir=.
+dir_given=0
 while [ $# -gt 0 ]; do
   case $1 in
     --dry-run) dry_run=1 ;;
@@ -52,12 +60,20 @@ while [ $# -gt 0 ]; do
     --sbom) sbom_only=1 ;;
     --force) force=1 ;;
     --no-envrc) write_envrc=0 ;;
+    --backup-ext)
+      [ $# -ge 2 ] || die "--backup-ext needs a value"
+      shift
+      backup_ext=$1
+      ;;
     -h | --help)
       usage
       exit 0
       ;;
     -*) die "unknown option '$1' (see --help)" ;;
-    *) dir=$1 ;;
+    *)
+      dir=$1
+      dir_given=1
+      ;;
   esac
   shift
 done
@@ -87,6 +103,9 @@ if [ "$sbom_only" = 1 ]; then
 fi
 
 NAME=$(manifest name)
+# Bundles made before `kind` existed are dev shells.
+KIND=$(manifest kind)
+KIND=${KIND:-devshell}
 DRV=$(manifest drv)
 CACHE_SHA256=$(manifest cache_sha256)
 NAR_SIZE=$(manifest nar_size)
@@ -107,10 +126,31 @@ for cmd in $required; do
 done
 LIX_TARBALL=$(manifest lix_tarball)
 DIRENV=$(manifest direnv)
-[ -n "$DRV" ] || die "manifest has no drv"
 [ -n "$CACHE_SHA256" ] || die "this bundle was made by an older nix-airgap (no binary cache); rebuild it"
-# Short id used for this shell's files and GC roots.
-ID=$(basename "$DRV" | cut -c1-12)
+case $KIND in
+  devshell)
+    [ -n "$DRV" ] || die "manifest has no drv"
+    PRIMARY=$DRV
+    # Short id used for this shell's files and GC roots.
+    ID=$(basename "$DRV" | cut -c1-12)
+    ;;
+  home)
+    ACTIVATION=$(manifest activation)
+    HOME_USER=$(manifest home_user)
+    HOME_DIRECTORY=$(manifest home_directory)
+    [ -n "$ACTIVATION" ] || die "manifest has no activation package"
+    PRIMARY=$ACTIVATION
+    [ "$dir_given" = 0 ] || die "Home Manager bundles don't take a project directory"
+    # Checked before anything is installed: activation is only valid for the
+    # user and home directory the configuration was built for.
+    me=$(id -un)
+    [ "$me" = "$HOME_USER" ] ||
+      die "this Home Manager configuration is for user '$HOME_USER', but you are '$me'; rebuild it with home.username and home.homeDirectory set for this machine"
+    [ "${HOME:-}" = "$HOME_DIRECTORY" ] ||
+      die "this Home Manager configuration is for home directory '$HOME_DIRECTORY', but \$HOME is '${HOME:-}'"
+    ;;
+  *) die "unsupported bundle kind '$KIND'; is this a newer nix-airgap bundle?" ;;
+esac
 
 if [ "$(id -u)" -eq 0 ]; then
   SUDO=
@@ -187,7 +227,16 @@ else
   $SUDO "$NIX_BIN/nix" --extra-experimental-features nix-command \
     copy --no-check-sigs --from "file://$tmp/cache" --stdin <"$tmp/cache/store-paths"
   rm -rf "$tmp/cache"
-  nix path-info "$DRV" >/dev/null 2>&1 || die "nix copy finished but $DRV is not in the store"
+  nix path-info "$PRIMARY" >/dev/null 2>&1 || die "nix copy finished but $PRIMARY is not in the store"
+fi
+
+# -- 5h. Home Manager: activate as the user. Activation installs home.packages
+# into the user's profile, links the managed files and roots the generation.
+if [ "$KIND" = home ]; then
+  info "activating Home Manager for $HOME_USER (files in the way are renamed to FILE.$backup_ext)"
+  run env PATH="$NIX_BIN:$PATH" HOME_MANAGER_BACKUP_EXT="$backup_ext" "$ACTIVATION/activate"
+  info "done. Start a new login shell to pick up the new environment."
+  exit 0
 fi
 
 # -- 5. direnv
