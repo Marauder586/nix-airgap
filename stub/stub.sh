@@ -86,15 +86,25 @@ if [ "$sbom_only" = 1 ]; then
   exit 0
 fi
 
-for cmd in zstd sha256sum; do
-  command -v "$cmd" >/dev/null 2>&1 || die "'$cmd' is required but not installed"
-done
 NAME=$(manifest name)
 DRV=$(manifest drv)
 CACHE_SHA256=$(manifest cache_sha256)
 NAR_SIZE=$(manifest nar_size)
 PATHS=$(manifest paths)
 ZSTD_LONG=$(manifest zstd_long)
+# Bundles made before `compression` existed are always zstd.
+COMPRESSION=$(manifest compression)
+COMPRESSION=${COMPRESSION:-zstd}
+CACHE=$(manifest cache)
+CACHE=${CACHE:-cache.tar.zst}
+case $COMPRESSION in
+  zstd) required="zstd sha256sum" ;;
+  none) required="sha256sum" ;;
+  *) die "unsupported cache compression '$COMPRESSION'; is this a newer nix-airgap bundle?" ;;
+esac
+for cmd in $required; do
+  command -v "$cmd" >/dev/null 2>&1 || die "'$cmd' is required but not installed"
+done
 LIX_TARBALL=$(manifest lix_tarball)
 DIRENV=$(manifest direnv)
 [ -n "$DRV" ] || die "manifest has no drv"
@@ -147,20 +157,32 @@ done
 
 # -- 3. Verify
 info "verifying checksum"
-actual=$(tar -xOf "$BUNDLE" cache.tar.zst | sha256sum | cut -d' ' -f1)
-[ "$actual" = "$CACHE_SHA256" ] || die "cache.tar.zst checksum mismatch; the bundle is corrupted"
+actual=$(tar -xOf "$BUNDLE" "$CACHE" | sha256sum | cut -d' ' -f1)
+[ "$actual" = "$CACHE_SHA256" ] || die "$CACHE checksum mismatch; the bundle is corrupted"
 
 # -- 4. Unpack the binary cache and nix copy it into the store. The cache is
 # not signed, hence --no-check-sigs; the checksum above covers integrity. The
 # paths are listed explicitly because with --all, Lix only learns each path's
 # hash from the cache, can't order paths by their references, and fails.
+# Writes the bundled cache tarball to stdout, decompressed.
+cache_tar() {
+  if [ "$COMPRESSION" = zstd ]; then
+    tar -xOf "$BUNDLE" "$CACHE" | zstd -dcq --long="$ZSTD_LONG"
+  else
+    tar -xOf "$BUNDLE" "$CACHE"
+  fi
+}
 info "unpacking the binary cache"
 if [ "$dry_run" = 1 ]; then
-  info "+ tar -xOf $BUNDLE cache.tar.zst | zstd -dc --long=$ZSTD_LONG | tar -x -C $tmp/cache"
+  if [ "$COMPRESSION" = zstd ]; then
+    info "+ tar -xOf $BUNDLE $CACHE | zstd -dc --long=$ZSTD_LONG | tar -x -C $tmp/cache"
+  else
+    info "+ tar -xOf $BUNDLE $CACHE | tar -x -C $tmp/cache"
+  fi
   info "+ $SUDO nix copy --no-check-sigs --from file://$tmp/cache --stdin < $tmp/cache/store-paths"
 else
   mkdir "$tmp/cache"
-  tar -xOf "$BUNDLE" cache.tar.zst | zstd -dcq --long="$ZSTD_LONG" | tar -xf - -C "$tmp/cache"
+  cache_tar | tar -xf - -C "$tmp/cache"
   info "copying store paths into /nix/store"
   $SUDO "$NIX_BIN/nix" --extra-experimental-features nix-command \
     copy --no-check-sigs --from "file://$tmp/cache" --stdin <"$tmp/cache/store-paths"

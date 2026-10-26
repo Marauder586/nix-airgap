@@ -82,16 +82,27 @@ rec {
       # direnv, each extra path and Lix whenever they are bundled.
       # `sh <bundle> --sbom` extracts it.
       sbom ? null,
-      # zstd settings for the bundled binary cache. `long` is the window log; the
-      # target needs about 2^long bytes of RAM to decompress.
+      # zstd settings for the bundled binary cache, merged over
+      # { level = 19; long = 31; }. `long` is the window log: zstd can match data
+      # up to 2^long bytes back, and decompressing takes about
+      # min(2^long, unpacked cache size) of RAM (a ~650 MB cache peaks near
+      # 650 MB, not 2 GiB). zstd won't decode windows over 2^27 (128 MiB) unless
+      # told to, so the installer passes --long. long = 27 caps decompression at
+      # ~128 MiB for a few percent more size (~4% on a Go dev shell).
+      # null bundles the cache uncompressed, so the target doesn't need zstd.
       compression ? { },
     }:
     let
-      zstd = {
-        level = 19;
-        long = 31;
-      }
-      // compression;
+      zstd =
+        if compression == null then
+          null
+        else
+          {
+            level = 19;
+            long = 31;
+          }
+          // compression;
+      cacheMember = if zstd == null then "cache.tar" else "cache.tar.zst";
       direnv = lib.optionalString includeDirenv "${pkgs.direnv}";
       runtime = pkgs.closureInfo {
         rootPaths = [ shell.inputDerivation ] ++ lib.optional includeDirenv pkgs.direnv ++ extraPaths;
@@ -147,8 +158,10 @@ rec {
         stub = ../stub/stub.sh;
         bundleName = name;
         inherit entry direnv;
-        zstdLevel = toString zstd.level;
-        zstdLong = toString zstd.long;
+        compressionKind = if zstd == null then "none" else "zstd";
+        zstdLevel = lib.optionalString (zstd != null) (toString zstd.level);
+        zstdLong = lib.optionalString (zstd != null) (toString zstd.long);
+        inherit cacheMember;
         lixInstaller = lib.optionalString includeLix "${lixInstaller}";
         lixTarball = lib.optionalString includeLix "${lixTarball}";
         lixTarballName = lib.optionalString includeLix lixTarballName;
@@ -193,12 +206,17 @@ rec {
         fi
 
         # An uncompressed binary cache, as `nix copy --to file://...?compression=none`
-        # writes it, packed into one zstd tarball: zstd --long finds the duplicate
-        # chunks spread across NARs that per-file compression can't.
+        # writes it, packed into one tarball and (by default) zstd: zstd --long
+        # finds the duplicate chunks spread across NARs that per-file compression
+        # can't.
         nix-airgap-tool cache --registration "$registration" --drv "$drv" \
           --out cache --stats stats
-        tar --sort=name --mtime=@1 --owner=0 --group=0 --numeric-owner -C cache -cf - . \
-          | zstd -q -T"$NIX_BUILD_CORES" --ultra -"$zstdLevel" --long="$zstdLong" -o cache.tar.zst
+        pack() { tar --sort=name --mtime=@1 --owner=0 --group=0 --numeric-owner -C cache -cf - .; }
+        if [ "$compressionKind" = zstd ]; then
+          pack | zstd -q -T"$NIX_BUILD_CORES" --ultra -"$zstdLevel" --long="$zstdLong" -o "$cacheMember"
+        else
+          pack > "$cacheMember"
+        fi
         rm -rf cache
 
         {
@@ -206,7 +224,9 @@ rec {
           echo "name=$bundleName"
           echo "drv=$drv"
           cat stats
-          echo "cache_sha256=$(sha256sum cache.tar.zst | cut -d' ' -f1)"
+          echo "compression=$compressionKind"
+          echo "cache=$cacheMember"
+          echo "cache_sha256=$(sha256sum "$cacheMember" | cut -d' ' -f1)"
           echo "zstd_long=$zstdLong"
           echo "direnv=$direnv"
           echo "lix_tarball=''${lixTarballName:+lix/$lixTarballName}"
@@ -214,7 +234,7 @@ rec {
         } > manifest
         cat manifest
 
-        members=(stub.sh="$stub" manifest=manifest cache.tar.zst=cache.tar.zst)
+        members=(stub.sh="$stub" manifest=manifest "$cacheMember=$cacheMember")
         if [ -n "$sbom" ]; then
           members+=(sbom.cdx.json=sbom.cdx.json)
         fi

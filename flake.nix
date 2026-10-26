@@ -174,6 +174,7 @@
                 done
                 dash ${bundle} --help | grep -q 'Usage:'
                 bash ${bundle} --list | grep -q cache.tar.zst
+                grep -qx 'compression=zstd' x/manifest
 
                 # --sbom extracts only the SBOM, needs no Nix, and won't clobber.
                 dash ${bundle} --sbom out
@@ -181,6 +182,48 @@
                 jq -e '.bomFormat == "CycloneDX"' out/sbom.cdx.json >/dev/null
                 ! dash ${bundle} --sbom out 2>err && grep -q 'already exists' err
                 dash ${bundle} --sbom --force out
+                touch $out
+              '';
+
+          # compression = null: an uncompressed cache.tar that needs no zstd on
+          # the target, still accepted by Nix and Lix.
+          bundle-uncompressed =
+            let
+              bundle = self.lib.mkDevShellBundle {
+                inherit pkgs;
+                shell = helloShell;
+                name = "hello";
+                compression = null;
+              };
+            in
+            pkgs.runCommand "check-bundle-uncompressed"
+              {
+                # No zstd here on purpose.
+                nativeBuildInputs = [
+                  pkgs.gnutar
+                  pkgs.dash
+                ];
+              }
+              ''
+                [ "$(tar -tf ${bundle})" = "$(printf 'stub.sh\nmanifest\ncache.tar')" ]
+                mkdir x && tar -xf ${bundle} -C x
+                grep -qx 'compression=none' x/manifest
+                grep -qx 'cache=cache.tar' x/manifest
+                grep -qx "cache_sha256=$(sha256sum x/cache.tar | cut -d' ' -f1)" x/manifest
+
+                mkdir cache && tar -xf x/cache.tar -C cache
+                export HOME=$TMPDIR
+                drv=$(sed -n 's/^drv=//p' x/manifest)
+                for impl in ${pkgs.nix} ${pkgs.lix}; do
+                  store="local?root=$TMPDIR/store-$(basename $impl)"
+                  $impl/bin/nix --extra-experimental-features nix-command copy --no-check-sigs \
+                    --from "file://$PWD/cache" --to "$store" --stdin < cache/store-paths
+                  $impl/bin/nix --extra-experimental-features nix-command path-info \
+                    --store "$store" "$drv" >/dev/null
+                done
+                ! command -v zstd
+                dash ${bundle} --help | grep -q 'Usage:'
+                dash ${bundle} --list | grep -q 'cache.tar$'
                 touch $out
               '';
 

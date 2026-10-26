@@ -52,7 +52,7 @@ gives `packages.<system>.airgap-<shell>`. Start a new project with
 | `includeDirenv` | `false`                      | Ship direnv and install it into the user's profile if missing       |
 | `extraPaths`    | `[ ]`                        | More store paths to import with the shell                           |
 | `sbom`          | `null`                       | A CycloneDX SBOM of the whole bundle to include (see [SBOM](#sbom)) |
-| `compression`   | `{ level = 19; long = 31; }` | zstd settings; the target needs ~2^`long` bytes of RAM              |
+| `compression`   | `{ level = 19; long = 31; }` | zstd settings (see below); `null` bundles the cache uncompressed    |
 
 ### Running the bundle
 
@@ -61,9 +61,10 @@ sh <bundle> [--dry-run] [--list] [--force] [--no-envrc] [project-dir]
 sh <bundle> --sbom [dir]
 ```
 
-The target needs `tar`, `zstd`, `sha256sum` and `sudo` (or root), and free space
-for the unpacked cache under `$TMPDIR` (default `/tmp`) plus the same again in
-`/nix/store`. The installer:
+The target needs `tar`, `sha256sum` and `sudo` (or root), plus `zstd` unless the
+bundle was built with `compression = null`, and free space for the unpacked cache
+under `$TMPDIR` (default `/tmp`) plus the same again in `/nix/store`. The
+installer:
 
 1. installs Lix from the bundle if Nix is missing (when built with `includeLix`),
 2. checks free space and the bundle's sha256,
@@ -138,7 +139,17 @@ path, `nar/*.nar`), inside the build sandbox and with no access to the Nix
 database. Every path's NAR hash is checked against `closureInfo`'s registration
 as it is written. The cache is uncompressed and then packed into a single
 `cache.tar.zst`, because zstd `--long` across all the NARs compresses far better
-than compressing each NAR on its own. `nix flake check` copies a bundle's cache
+than compressing each NAR on its own (`compression = null` ships it as a plain
+`cache.tar` instead).
+
+**Compression and memory.** `compression.long` is zstd's window log: it can
+reuse data up to 2^`long` bytes back, and decompressing takes about
+min(2^`long`, unpacked cache size) of RAM. With the default `long = 31` (a
+2 GiB window), a Go dev shell's ~650 MB cache peaked at ~658 MB while
+decompressing, not 2 GiB. zstd refuses windows over 2^27 (128 MiB) unless told
+otherwise, which is why the installer passes `--long`. `long = 27` caps
+decompression memory at ~128 MiB; on that same shell it was only ~4% larger
+(108 vs 104 MiB). `nix flake check` copies a bundle's cache
 into scratch stores with both Nix's and Lix's `nix copy` to prove they accept it. The cache is
 unsigned; the bundle's sha256 covers integrity.
 
@@ -151,7 +162,8 @@ name field every tar implementation ignores. That field holds:
 
 A shell runs that line, which runs the installer (`stub/stub.sh`) out of the
 archive and exits before reaching any binary data. The other members are
-`stub.sh`, `manifest`, `cache.tar.zst`, and optionally `sbom.cdx.json` and `lix/`.
+`stub.sh`, `manifest`, `cache.tar.zst` (or `cache.tar` with `compression = null`),
+and optionally `sbom.cdx.json` and `lix/`.
 
 ## Testing
 
