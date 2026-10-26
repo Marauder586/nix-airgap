@@ -1,0 +1,26 @@
+# `nix fmt` runs treefmt with these formatters; `nix flake check` fails on drift.
+excludes = ["flake.lock", "tool/Cargo.lock", ".gitignore"]
+
+[formatter.nixfmt]
+command = "nixfmt"
+includes = ["*.nix"]
+
+[formatter.rustfmt]
+command = "rustfmt"
+options = ["--edition", "2021"]
+includes = ["*.rs"]
+
+[formatter.shfmt]
+command = "shfmt"
+options = ["--write", "--indent", "2", "--case-indent"]
+includes = ["*.sh"]
+
+[formatter.prettier]
+command = "prettier"
+options = ["--write"]
+includes = ["*.md"]
+
+[formatter.taplo]
+command = "taplo"
+options = ["format"]
+includes = ["*.toml"]

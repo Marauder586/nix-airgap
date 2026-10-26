@@ -1,0 +1,36 @@
+[package]
+name = "nix-airgap-tool"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Builds self-installing tar/sh polyglot bundles of Nix store closures"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/Marauder586/nix-airgap"
+keywords = ["nix", "airgap", "tar", "nar"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+sha2 = "0.10"
+
+[profile.release]
+lto = true
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_qualifications = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+# Selected restriction lints: no panicking shortcuts outside tests.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
+indexing_slicing = "warn"
+string_slice = "warn"
+as_conversions = "warn"
