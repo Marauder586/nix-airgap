@@ -16,6 +16,7 @@ use std::path::PathBuf;
 const BLOCK: u64 = 512;
 const BLOCK_BYTES: usize = 512;
 
+#[derive(Clone, Debug)]
 pub struct Member {
     pub name: String,
     pub path: PathBuf,

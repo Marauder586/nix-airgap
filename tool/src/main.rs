@@ -12,26 +12,73 @@ mod nar;
 mod tar;
 mod wire;
 
+use clap::{Parser, Subcommand};
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-const USAGE: &str = "\
-Usage:
-  nix-airgap-tool cache --out DIR [--registration FILE]... [--drv DRV]... [--stats FILE]
-      Write an uncompressed `file://` binary cache (for `nix copy --from`)
-      containing the closures listed in closureInfo registration files plus the
-      derivation closure (.drv files and their sources, but not their outputs)
-      of each --drv.
+#[derive(Parser)]
+#[command(
+    version,
+    about = "Builds self-installing tar/sh polyglot bundles of Nix store closures"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
 
-  nix-airgap-tool polyglot --entry LINE --out FILE NAME=PATH...
-      Write a ustar archive whose first header is a pax global header named LINE,
-      so the archive can also be run with `sh FILE`.
-";
+#[derive(Subcommand)]
+enum Command {
+    /// Write a store closure as an uncompressed `file://` binary cache
+    ///
+    /// The cache (for `nix copy --from`) contains the closures listed in
+    /// closureInfo registration files plus the derivation closure (.drv files
+    /// and their sources, but not their outputs) of each --drv, and a
+    /// `store-paths` file listing every path in it.
+    Cache {
+        /// Directory to write the cache into.
+        #[arg(long, value_name = "DIR")]
+        out: PathBuf,
+        /// A closureInfo `registration` file; repeatable.
+        #[arg(long, value_name = "FILE")]
+        registration: Vec<PathBuf>,
+        /// A .drv whose derivation closure to include; repeatable.
+        #[arg(long, value_name = "DRV")]
+        drv: Vec<PathBuf>,
+        /// Write `paths=` and `nar_size=` here instead of to stderr.
+        #[arg(long, value_name = "FILE")]
+        stats: Option<PathBuf>,
+    },
+    /// Write a tar archive that is also a shell script
+    ///
+    /// The archive's first header is a pax global header named LINE, which tar
+    /// ignores and a shell runs, so the archive can also be run with `sh FILE`.
+    Polyglot {
+        /// The shell line to put in the first header (no '/', at most 99 bytes).
+        #[arg(long, value_name = "LINE")]
+        entry: String,
+        /// The archive to write.
+        #[arg(long, value_name = "FILE")]
+        out: PathBuf,
+        /// Archive members, in order.
+        #[arg(value_name = "NAME=PATH", required = true, value_parser = parse_member)]
+        members: Vec<tar::Member>,
+    },
+}
+
+fn parse_member(s: &str) -> Result<tar::Member, String> {
+    let (name, path) = s
+        .split_once('=')
+        .ok_or_else(|| format!("'{s}' is not NAME=PATH"))?;
+    Ok(tar::Member {
+        name: name.to_owned(),
+        path: PathBuf::from(path),
+    })
+}
 
 fn main() -> ExitCode {
-    match run(&std::env::args().skip(1).collect::<Vec<_>>()) {
+    match run(Cli::parse().command) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("nix-airgap-tool: {e}");
@@ -40,105 +87,96 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(args: &[String]) -> Result<(), String> {
-    let (cmd, rest) = args.split_first().ok_or(USAGE)?;
-    match cmd.as_str() {
-        "cache" => cmd_cache(rest),
-        "polyglot" => cmd_polyglot(rest),
-        "-h" | "--help" => {
-            print!("{USAGE}");
+fn run(command: Command) -> Result<(), String> {
+    match command {
+        Command::Cache {
+            out,
+            registration,
+            drv,
+            stats,
+        } => {
+            let closure = cache::Closure::collect(&registration, &drv)?;
+            let stats_text = {
+                let s = closure.write_cache(&out)?;
+                format!("paths={}\nnar_size={}\n", s.paths, s.nar_size)
+            };
+            match stats {
+                None => eprint!("{stats_text}"),
+                Some(p) => std::fs::write(&p, stats_text)
+                    .map_err(|e| format!("writing {}: {e}", p.display()))?,
+            }
             Ok(())
         }
-        _ => Err(format!("unknown command '{cmd}'\n\n{USAGE}")),
-    }
-}
-
-/// Pulls `--flag VALUE` pairs out of `args`, leaving positional arguments.
-struct Args {
-    flags: Vec<(String, String)>,
-    positional: Vec<String>,
-}
-
-impl Args {
-    fn parse(args: &[String], known: &[&str]) -> Result<Self, String> {
-        let mut flags = Vec::new();
-        let mut positional = Vec::new();
-        let mut it = args.iter();
-        while let Some(a) = it.next() {
-            if known.contains(&a.as_str()) {
-                let v = it.next().ok_or_else(|| format!("{a} needs a value"))?;
-                flags.push((a.clone(), v.clone()));
-            } else if a.starts_with("--") {
-                return Err(format!("unknown flag '{a}'\n\n{USAGE}"));
-            } else {
-                positional.push(a.clone());
-            }
-        }
-        Ok(Self { flags, positional })
-    }
-
-    fn all(&self, name: &str) -> Vec<&str> {
-        self.flags
-            .iter()
-            .filter(|(k, _)| k == name)
-            .map(|(_, v)| v.as_str())
-            .collect()
-    }
-
-    fn one(&self, name: &str) -> Result<&str, String> {
-        match self.all(name).as_slice() {
-            [v] => Ok(v),
-            [] => Err(format!("missing {name}")),
-            _ => Err(format!("{name} given more than once")),
+        Command::Polyglot {
+            entry,
+            out,
+            members,
+        } => {
+            let f = File::create(&out).map_err(|e| format!("creating {}: {e}", out.display()))?;
+            let mut w = BufWriter::new(f);
+            tar::write_polyglot(&mut w, &entry, &members)?;
+            w.flush()
+                .map_err(|e| format!("writing {}: {e}", out.display()))
         }
     }
 }
 
-fn cmd_cache(args: &[String]) -> Result<(), String> {
-    let a = Args::parse(args, &["--out", "--registration", "--drv", "--stats"])?;
-    if !a.positional.is_empty() {
-        return Err(format!("unexpected arguments: {:?}", a.positional));
-    }
-    let registrations: Vec<PathBuf> = a
-        .all("--registration")
-        .into_iter()
-        .map(PathBuf::from)
-        .collect();
-    let drvs: Vec<PathBuf> = a.all("--drv").into_iter().map(PathBuf::from).collect();
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
 
-    let closure = cache::Closure::collect(&registrations, &drvs)?;
-    let stats = closure.write_cache(Path::new(a.one("--out")?))?;
-
-    let summary = format!("paths={}\nnar_size={}\n", stats.paths, stats.nar_size);
-    match a.all("--stats").as_slice() {
-        [] => eprint!("{summary}"),
-        [p] => std::fs::write(p, summary).map_err(|e| format!("writing {p}: {e}"))?,
-        _ => return Err("--stats given more than once".into()),
+    #[test]
+    fn cli_is_consistent() {
+        Cli::command().debug_assert();
     }
-    Ok(())
-}
 
-fn cmd_polyglot(args: &[String]) -> Result<(), String> {
-    let a = Args::parse(args, &["--out", "--entry"])?;
-    let members = a
-        .positional
-        .iter()
-        .map(|m| {
-            let (name, path) = m
-                .split_once('=')
-                .ok_or_else(|| format!("member '{m}' is not NAME=PATH"))?;
-            Ok(tar::Member {
-                name: name.to_string(),
-                path: PathBuf::from(path),
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    if members.is_empty() {
-        return Err("polyglot needs at least one NAME=PATH member".into());
+    #[test]
+    fn parses_the_bundle_builders_invocations() {
+        let cli = Cli::try_parse_from([
+            "nix-airgap-tool",
+            "cache",
+            "--registration",
+            "reg",
+            "--drv",
+            "/nix/store/x.drv",
+            "--out",
+            "cache",
+            "--stats",
+            "stats",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Command::Cache { ref drv, .. } if drv.len() == 1));
+
+        let cli = Cli::try_parse_from([
+            "nix-airgap-tool",
+            "polyglot",
+            "--entry",
+            ":;exit",
+            "--out",
+            "o.tar",
+            "stub.sh=/a",
+            "lix/x=/b",
+        ])
+        .unwrap();
+        let Command::Polyglot { members, .. } = cli.command else {
+            panic!("not polyglot");
+        };
+        assert_eq!(members[1].name, "lix/x");
+
+        assert!(Cli::try_parse_from([
+            "nix-airgap-tool",
+            "polyglot",
+            "--entry",
+            "x",
+            "--out",
+            "o",
+            "bad"
+        ])
+        .is_err());
+        assert!(
+            Cli::try_parse_from(["nix-airgap-tool", "polyglot", "--entry", "x", "--out", "o"])
+                .is_err()
+        );
     }
-    let out = a.one("--out")?;
-    let f = File::create(out).map_err(|e| format!("creating {out}: {e}"))?;
-    let mut w = BufWriter::new(f);
-    tar::write_polyglot(&mut w, a.one("--entry")?, &members)?;
-    w.flush().map_err(|e| format!("writing {out}: {e}"))
 }

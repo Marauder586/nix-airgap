@@ -11,6 +11,7 @@ keywords = ["nix", "airgap", "tar", "nar"]
 categories = ["command-line-utilities"]
 
 [dependencies]
+clap = { version = "4.5.61", features = ["derive"] }
 sha2 = "0.10"
 
 [profile.release]
